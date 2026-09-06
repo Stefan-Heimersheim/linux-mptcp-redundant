@@ -1,0 +1,6 @@
+linux-rpi/
+out/
+*.deb
+*.buildinfo
+*.changes
+build-*/
