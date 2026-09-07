@@ -33,6 +33,14 @@ CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 JOBS="${JOBS:-$(nproc)}"
 LOCALVERSION="-mptcp-redundant"
 
+# Identity embedded in the artifacts instead of the build machine's user@host:
+# the .deb Maintainer field (mkdebian reads DEBFULLNAME/DEBEMAIL) and the
+# "Linux version ... (user@host)" banner in /proc/version.
+export DEBFULLNAME="${DEBFULLNAME:-Stefan Heimersheim}"
+export DEBEMAIL="${DEBEMAIL:-stefan.heimersheim@gmail.com}"
+export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-stefan.heimersheim}"
+export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-gmail.com}"
+
 TARGETS="arm64 x86_64"
 RELEASE=false
 RELEASE_ONLY=false
