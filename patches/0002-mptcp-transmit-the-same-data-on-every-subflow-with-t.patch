@@ -1,0 +1,384 @@
+From d3c3ca4da82de424f01d10caaccb1dfa7f531582 Mon Sep 17 00:00:00 2001
+From: Stefan Heimersheim <stefan.heimersheim@gmail.com>
+Date: Sat, 5 Sep 2026 22:43:48 +0100
+Subject: [PATCH 2/4] mptcp: transmit the same data on every subflow with the
+ redundant scheduler
+
+The MPTCP push path is written for one subflow per scheduling round.
+__subflow_push_pending() sends from the connection-level send head
+(msk->first_pending / dfrag->already_sent) and advances it, so when the
+scheduler marks several subflows the second one continues where the
+first stopped: the data is spread over the subflows, only the
+retransmit path (__mptcp_retrans()) really sends the same range on each
+scheduled subflow. The in-tree BPF "red" test scheduler has the same
+limitation.
+
+Make the "redundant" scheduler actually redundant by adding a per-subflow
+catch-up step in front of the normal push:
+
+ - Each subflow remembers in subflow->redundant_seq the msk-level
+   sequence number up to which it has carried data (protected by the
+   msk socket lock like the rest of the send state).
+
+ - mptcp_subflow_push(), now called wherever __subflow_push_pending()
+   used to be called from __mptcp_push_pending() and
+   __mptcp_subflow_push_pending(), first runs __subflow_push_redundant()
+   when the connection uses the redundant scheduler and has not fallen
+   back to TCP. That walks the rtx queue from the subflow's redundant_seq
+   to the current send head and re-sends that range on this subflow via
+   mptcp_sendmsg_frag() with an explicit [info->sent, info->limit)
+   window, the same way __mptcp_retrans() does. The DSS mapping comes
+   from the dfrag, so for the receiver the copy is indistinguishable
+   from the original and is dropped as a duplicate (MPTcpExtDuplicateData).
+   already_sent, snd_nxt, bytes_retrans and MPTCP_MIB_RETRANSSEGS are
+   left alone: from the connection's point of view nothing new happened.
+
+ - Only when the subflow is fully caught up does it get new data via the
+   unchanged __subflow_push_pending(); afterwards redundant_seq is set to
+   the new send head, because the head only moved by what this subflow
+   just carried. A subflow that runs out of send buffer space in the
+   middle of catching up gets no new data this round and resumes next
+   time, so the stream stays identical on all paths as far as memory
+   permits.
+
+ - redundant_seq is clamped to [snd_una, send head]: data below snd_una
+   has been acked and freed, so a subflow that fell far behind (fresh
+   MP_JOIN, or long without buffer space) restarts from the oldest
+   unacked byte, which is exactly what the peer is waiting for. A new
+   subflow therefore first re-sends the whole unacked window.
+
+ - Both push loops used to run only while there is new data
+   (mptcp_send_head() != NULL). With redundancy a subflow can still be
+   behind when the last byte of a burst has been handed out, e.g. when
+   the burst was larger than its send buffer while the sibling with the
+   bigger autotuned buffer took it all; without a further push round
+   that tail would never be duplicated. mptcp_redundant_lagging() lets
+   the loops also run while an active subflow's redundant_seq is not at
+   the send head, so the subflow catches up on its own ACKs. For other
+   schedulers it is a cheap pointer comparison that returns false.
+
+ - Such a round can visit a subflow without queueing anything on it.
+   info->mss_now is only set by mptcp_sendmsg_frag(), and tcp_push() ->
+   tcp_write_xmit() -> tcp_tso_segs() divides by it, so the flush after a
+   round (mptcp_push_flush(), used by mptcp_push_release() and the
+   ACK-driven path) computes mss_now via tcp_send_mss() when it is still
+   zero. Without this a subflow with unsent TCP data crashed the sender
+   with a divide error in the worker.
+
+With this, both the sendmsg-driven push and the ACK-driven push
+(__mptcp_check_push() -> __mptcp_subflow_push_pending(), which carries
+most of a bulk transfer) produce redundant copies: every subflow, when it
+gets a chance to send, first duplicates what the others sent, then sends
+new data itself, and the others duplicate that in turn. No new locking is
+introduced; the catch-up runs where __subflow_push_pending() already ran,
+with the same locks held and the same GFP context.
+
+The default scheduler and BPF schedulers take the old path verbatim
+(mptcp_sched_is_redundant() is a pointer comparison).
+
+Known limitations:
+
+ - Redundancy is best effort per round: a subflow without send buffer
+   space skips ranges that get acked before it has room again. On a link
+   slower than the stream this means it carries the oldest unacked data
+   instead of everything.
+ - Once the peer has received everything and closes, late duplicates are
+   pointless; a subflow that was far behind at the very end of a transfer
+   may therefore not reach 100 % of the payload.
+ - snd_burst is not maintained by the redundant scheduler (as for BPF
+   schedulers), so each push round hands out one dfrag (up to 32 KB)
+   per subflow before rescheduling.
+ - During failover recovery (__mptcp_retransmit_pending_data()) the
+   re-injected data is treated like new data; the remaining subflows
+   duplicate it through the same catch-up mechanism.
+ - Throughput is bounded by the fastest link, and the total bytes on the
+   wire are N times the payload for N links; that is the point.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ net/mptcp/protocol.c | 205 +++++++++++++++++++++++++++++++++++++++++--
+ net/mptcp/protocol.h |   4 +
+ 2 files changed, 201 insertions(+), 8 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 8b61fe656..6dd3fd847 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1565,9 +1565,21 @@ struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
+ 	return ssk;
+ }
+ 
+-static void mptcp_push_release(struct sock *ssk, struct mptcp_sendmsg_info *info)
++/* Flush what a push round queued on ssk. info->mss_now is only initialised
++ * by mptcp_sendmsg_frag(); with the redundant scheduler a round can visit a
++ * subflow without queueing anything on it (already caught up, no new data),
++ * and tcp_write_xmit() divides by mss_now, so compute it here when needed.
++ */
++static void mptcp_push_flush(struct sock *ssk, struct mptcp_sendmsg_info *info)
+ {
++	if (unlikely(!info->mss_now))
++		info->mss_now = tcp_send_mss(ssk, &info->size_goal, info->flags);
+ 	tcp_push(ssk, 0, info->mss_now, tcp_sk(ssk)->nonagle, info->size_goal);
++}
++
++static void mptcp_push_release(struct sock *ssk, struct mptcp_sendmsg_info *info)
++{
++	mptcp_push_flush(ssk, info);
+ 	release_sock(ssk);
+ }
+ 
+@@ -1651,6 +1663,182 @@ static int __subflow_push_pending(struct sock *sk, struct sock *ssk,
+ 	return err;
+ }
+ 
++/* msk-level sequence number of the send head, i.e. of the first byte that
++ * has not been handed to any subflow yet.
++ */
++static u64 mptcp_send_head_seq(const struct mptcp_sock *msk)
++{
++	const struct mptcp_data_frag *dfrag = msk->first_pending;
++
++	if (!dfrag) {
++		if (list_empty(&msk->rtx_queue))
++			return msk->snd_una;
++		dfrag = list_last_entry(&msk->rtx_queue,
++					struct mptcp_data_frag, list);
++	}
++	return dfrag->data_seq + dfrag->already_sent;
++}
++
++/* Redundant scheduler helper: hand ssk every byte between what it has
++ * already carried (subflow->redundant_seq) and the current send head, i.e.
++ * the data other subflows have transmitted in the meantime, so that all
++ * subflows end up carrying the same stream.
++ *
++ * Only data still in the rtx queue can be re-sent: a subflow that fell
++ * behind by more than the unacked window (a fresh MP_JOIN, or a subflow
++ * that was without send buffer space for a while) restarts from snd_una,
++ * which is exactly the oldest data the peer is still waiting for.
++ *
++ * Like __mptcp_retrans() this walks the rtx queue with the msk socket lock
++ * held and the subflow socket locked by the caller; it uses
++ * mptcp_sendmsg_frag() with an explicit [info->sent, info->limit) range so
++ * the DSS mappings are derived from the dfrag and the copies are
++ * indistinguishable from the original transmission for the receiver, which
++ * discards the duplicate and accounts it in MPTcpExtDuplicateData.
++ *
++ * Unlike a retransmission it does not touch dfrag->already_sent, snd_nxt,
++ * bytes_retrans or MPTCP_MIB_RETRANSSEGS: from the connection's point of
++ * view nothing new happened.
++ *
++ * Returns the number of bytes handed to ssk, or a negative error if nothing
++ * could be sent. *caught_up tells whether ssk now carries everything up to
++ * the send head.
++ */
++static int __subflow_push_redundant(struct sock *sk, struct sock *ssk,
++				    struct mptcp_sendmsg_info *info,
++				    bool *caught_up)
++{
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
++	struct mptcp_sock *msk = mptcp_sk(sk);
++	struct mptcp_data_frag *dfrag, *head;
++	u64 seq, target, snd_una;
++	int copied = 0, ret = 0;
++
++	*caught_up = true;
++	if (list_empty(&msk->rtx_queue))
++		return 0;
++
++	/* the send head, or the last dfrag if everything has been handed out */
++	head = msk->first_pending;
++	dfrag = head ? head : list_last_entry(&msk->rtx_queue,
++					      struct mptcp_data_frag, list);
++	target = dfrag->data_seq + dfrag->already_sent;
++
++	snd_una = READ_ONCE(msk->snd_una);
++	seq = subflow->redundant_seq;
++	if (before64(seq, snd_una) || after64(seq, target))
++		seq = snd_una;
++
++	if (seq == target)
++		goto out;
++
++	/* walk back from the send head to the dfrag containing seq; this is
++	 * short in steady state as a subflow is at most one round behind
++	 */
++	while (after64(dfrag->data_seq, seq) &&
++	       !list_is_first(&dfrag->list, &msk->rtx_queue))
++		dfrag = list_prev_entry(dfrag, list);
++
++	for (;;) {
++		u64 end = dfrag->data_seq + dfrag->already_sent;
++
++		if (after64(end, seq)) {
++			if (WARN_ON_ONCE(before64(seq, dfrag->data_seq)))
++				seq = dfrag->data_seq;
++
++			info->sent = seq - dfrag->data_seq;
++			info->limit = dfrag->already_sent;
++			while (info->sent < info->limit) {
++				ret = mptcp_sendmsg_frag(sk, ssk, dfrag, info);
++				if (ret <= 0)
++					break;
++
++				info->sent += ret;
++				copied += ret;
++			}
++			seq = dfrag->data_seq + info->sent;
++			if (ret <= 0)
++				break;
++		}
++
++		/* dfrags past the send head have not been sent by anyone */
++		if (dfrag == head ||
++		    list_is_last(&dfrag->list, &msk->rtx_queue))
++			break;
++		if (!sk_stream_memory_free(ssk))
++			break;
++		dfrag = list_next_entry(dfrag, list);
++	}
++
++out:
++	subflow->redundant_seq = seq;
++	*caught_up = seq == target;
++	if (copied)
++		msk->last_data_sent = tcp_jiffies32;
++	return copied ? copied : ret;
++}
++
++/* Push pending data on ssk. With the redundant scheduler ssk first catches
++ * up on everything the other subflows already carry and only then moves the
++ * send head forward; a subflow that cannot fully catch up (out of send
++ * buffer space) does not get new data this round, so the stream stays
++ * identical on all paths as far as memory permits.
++ *
++ * Any other scheduler (including the default one) takes the plain
++ * __subflow_push_pending() path, unchanged.
++ */
++static int mptcp_subflow_push(struct sock *sk, struct sock *ssk,
++			      struct mptcp_sendmsg_info *info)
++{
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
++	struct mptcp_sock *msk = mptcp_sk(sk);
++	bool redundant, caught_up;
++	int copied = 0, ret;
++
++	redundant = mptcp_sched_is_redundant(msk) &&
++		    !__mptcp_check_fallback(msk);
++	if (redundant) {
++		ret = __subflow_push_redundant(sk, ssk, info, &caught_up);
++		if (ret > 0)
++			copied = ret;
++		if (!caught_up)
++			return copied ? copied : ret;
++	}
++
++	ret = __subflow_push_pending(sk, ssk, info);
++	if (ret > 0) {
++		copied += ret;
++		/* the send head only moved by what ssk just carried */
++		if (redundant)
++			subflow->redundant_seq = mptcp_send_head_seq(msk);
++	}
++	return copied ? copied : ret;
++}
++
++/* Redundant scheduler: is there a subflow that still has to catch up with
++ * the send head? Such a subflow needs a push round even when there is no new
++ * data, otherwise the tail of a burst would only ever be carried by the
++ * subflow that happened to hand it out.
++ */
++static bool mptcp_redundant_lagging(struct sock *sk)
++{
++	struct mptcp_sock *msk = mptcp_sk(sk);
++	struct mptcp_subflow_context *subflow;
++	u64 head;
++
++	if (!mptcp_sched_is_redundant(msk) || __mptcp_check_fallback(msk) ||
++	    list_empty(&msk->rtx_queue))
++		return false;
++
++	head = mptcp_send_head_seq(msk);
++	mptcp_for_each_subflow(msk, subflow) {
++		if (subflow->redundant_seq != head &&
++		    __mptcp_subflow_active(subflow))
++			return true;
++	}
++	return false;
++}
++
+ void __mptcp_push_pending(struct sock *sk, unsigned int flags)
+ {
+ 	struct sock *prev_ssk = NULL, *ssk = NULL;
+@@ -1661,7 +1849,8 @@ void __mptcp_push_pending(struct sock *sk, unsigned int flags)
+ 	bool copied = false;
+ 	int push_count = 1;
+ 
+-	while (mptcp_send_head(sk) && (push_count > 0)) {
++	while ((mptcp_send_head(sk) || mptcp_redundant_lagging(sk)) &&
++	       (push_count > 0)) {
+ 		struct mptcp_subflow_context *subflow;
+ 		int ret = 0;
+ 
+@@ -1692,7 +1881,7 @@ void __mptcp_push_pending(struct sock *sk, unsigned int flags)
+ 
+ 				push_count++;
+ 
+-				ret = __subflow_push_pending(sk, ssk, &info);
++				ret = mptcp_subflow_push(sk, ssk, &info);
+ 				if (ret <= 0) {
+ 					if (ret != -EAGAIN ||
+ 					    (1 << ssk->sk_state) &
+@@ -1730,7 +1919,8 @@ static void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk, bool
+ 	int copied = 0;
+ 
+ 	info.flags = 0;
+-	while (mptcp_send_head(sk) && keep_pushing) {
++	while ((mptcp_send_head(sk) || mptcp_redundant_lagging(sk)) &&
++	       keep_pushing) {
+ 		struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+ 		int ret = 0;
+ 
+@@ -1739,7 +1929,7 @@ static void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk, bool
+ 		 */
+ 		if (first) {
+ 			mptcp_subflow_set_scheduled(subflow, false);
+-			ret = __subflow_push_pending(sk, ssk, &info);
++			ret = mptcp_subflow_push(sk, ssk, &info);
+ 			first = false;
+ 			if (ret <= 0)
+ 				break;
+@@ -1752,7 +1942,7 @@ static void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk, bool
+ 
+ 		if (READ_ONCE(subflow->scheduled)) {
+ 			mptcp_subflow_set_scheduled(subflow, false);
+-			ret = __subflow_push_pending(sk, ssk, &info);
++			ret = mptcp_subflow_push(sk, ssk, &info);
+ 			if (ret <= 0)
+ 				keep_pushing = false;
+ 			copied += ret;
+@@ -1775,8 +1965,7 @@ static void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk, bool
+ 	 * not going to flush it via release_sock()
+ 	 */
+ 	if (copied) {
+-		tcp_push(ssk, 0, info.mss_now, tcp_sk(ssk)->nonagle,
+-			 info.size_goal);
++		mptcp_push_flush(ssk, &info);
+ 		if (!mptcp_rtx_timer_pending(sk))
+ 			mptcp_reset_rtx_timer(sk);
+ 
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 50ace2239..6a05cd94b 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -579,6 +579,10 @@ struct mptcp_subflow_context {
+ 	int     cached_sndbuf;	    /* sndbuf size when last synced with the msk sndbuf,
+ 				     * protected by the msk socket lock
+ 				     */
++	u64	redundant_seq;	    /* redundant scheduler: msk-level sequence number up to
++				     * which this subflow has been handed data; protected
++				     * by the msk socket lock
++				     */
+ 
+ 	struct	sock *tcp_sock;	    /* tcp sk backpointer */
+ 	struct	sock *conn;	    /* parent mptcp_sock */

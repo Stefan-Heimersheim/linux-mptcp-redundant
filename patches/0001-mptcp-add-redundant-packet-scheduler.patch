@@ -1,0 +1,149 @@
+From 4c56533538f4d193bc5aa0aa1c2b9af13742ff9a Mon Sep 17 00:00:00 2001
+From: Stefan Heimersheim <stefan.heimersheim@gmail.com>
+Date: Sat, 5 Sep 2026 22:43:48 +0100
+Subject: [PATCH 1/4] mptcp: add "redundant" packet scheduler
+
+Register a second in-kernel packet scheduler, "redundant", next to the
+default one. Where the default scheduler picks a single subflow per
+scheduling round, this one marks every usable subflow, so that the data
+path transmits the same data on all of them. The intended use is a
+multi-homed router (several LTE modems) talking to a fixed peer: a stall
+or loss burst on one link must not delay the stream because the same
+bytes are already in flight on the other links.
+
+For new data (data->reinject == 0) a subflow is usable when it is active
+(MP_JOIN completed, TCP state allows sending) and sk_stream_memory_free()
+reports send buffer space. Backup-flagged subflows are not excluded on
+purpose: in this use case every link should carry the data. The path
+manager's "stale" flag is not honoured either: it is set after a handful
+of msk retransmit-timer expiries without progress on a subflow, and the
+msk timer interval is derived from the subflows' pending TCP timers (often
+a short tail-loss-probe timeout), so healthy but bursty links get marked
+stale now and then. The default scheduler merely prefers another subflow
+in that case; for a redundant scheduler, excluding the subflow means it
+misses ranges that are acked before it is un-staled, i.e. holes in the
+redundancy (measured: a path carrying 84-89 % instead of 107 % of the
+payload in a few percent of runs). A really dead link stops being fed as
+soon as its send buffer is full. A subflow that is skipped because its
+buffer is full catches up later, see the following commit.
+
+For retransmissions (data->reinject == 1) the rules of the default
+mptcp_subflow_get_retrans() are kept: only subflows whose TCP write and
+retransmit queues are empty are used, the others are fed to the stale
+detection exactly as before. The difference is again that all eligible
+subflows are marked instead of the first non-backup one.
+
+Marking several subflows is only half of the job: with the unmodified
+push path, __subflow_push_pending() walks the connection-level
+already_sent cursor, so a second scheduled subflow continues where the
+first stopped and the data is distributed, not duplicated. The next
+commit adds the missing catch-up logic; mptcp_sched_is_redundant() is
+exported for it so that no other scheduler's behaviour changes.
+
+Select it with
+
+    sysctl -w net.mptcp.scheduler=redundant
+
+before the socket is created (the scheduler is bound at socket
+initialisation, per network namespace).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ net/mptcp/protocol.h |  1 +
+ net/mptcp/sched.c    | 64 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 36f3f5b34..50ace2239 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -766,6 +766,7 @@ struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk);
+ struct sock *mptcp_subflow_get_retrans(struct mptcp_sock *msk);
+ int mptcp_sched_get_send(struct mptcp_sock *msk);
+ int mptcp_sched_get_retrans(struct mptcp_sock *msk);
++bool mptcp_sched_is_redundant(const struct mptcp_sock *msk);
+ 
+ static inline u64 mptcp_data_avail(const struct mptcp_sock *msk)
+ {
+diff --git a/net/mptcp/sched.c b/net/mptcp/sched.c
+index 78ed508eb..65e6f8616 100644
+--- a/net/mptcp/sched.c
++++ b/net/mptcp/sched.c
+@@ -36,6 +36,69 @@ static struct mptcp_sched_ops mptcp_sched_default = {
+ 	.owner		= THIS_MODULE,
+ };
+ 
++/* Redundant scheduler: mark every usable subflow so that the same data is
++ * transmitted on all of them.
++ *
++ * For new data (!data->reinject) a subflow is usable when it is active (join
++ * completed, TCP state allows sending) and its send buffer has room. A
++ * subflow that is skipped for lack of buffer space catches up on the data it
++ * missed in a later round, see __subflow_push_redundant() in protocol.c.
++ * Backup-flagged subflows are deliberately not excluded: the point of this
++ * scheduler is that every path carries every byte. The path manager's
++ * "stale" flag is not honoured here either: it is set after a few msk
++ * retransmit-timer expiries without progress, which happens on healthy but
++ * bursty links too, and a subflow that is excluded while stale would miss
++ * (and never duplicate) whatever gets acked meanwhile. A really dead link
++ * stops being fed once its send buffer is full.
++ *
++ * For retransmissions (data->reinject) the default scheduler's rules are
++ * kept: only subflows with empty TCP write/retransmit queues are used, since
++ * a subflow that still has unacked data queued is either slow or dead and
++ * TCP already retransmits on it; those subflows are fed to the stale
++ * detection exactly like mptcp_subflow_get_retrans() does. All idle subflows
++ * are marked, not just the first non-backup one.
++ */
++static int mptcp_sched_redundant_get_subflow(struct mptcp_sock *msk,
++					     struct mptcp_sched_data *data)
++{
++	struct mptcp_subflow_context *subflow;
++	int n = 0;
++
++	mptcp_for_each_subflow(msk, subflow) {
++		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++
++		if (data->reinject) {
++			/* same rules as mptcp_subflow_get_retrans() */
++			if (!__mptcp_subflow_active(subflow))
++				continue;
++
++			if (!tcp_rtx_and_write_queues_empty(ssk)) {
++				mptcp_pm_subflow_chk_stale(msk, ssk);
++				continue;
++			}
++		} else if (!__mptcp_subflow_active(subflow) ||
++			   !sk_stream_memory_free(ssk)) {
++			continue;
++		}
++
++		mptcp_subflow_set_scheduled(subflow, true);
++		n++;
++	}
++
++	return n ? 0 : -EINVAL;
++}
++
++static struct mptcp_sched_ops mptcp_sched_redundant = {
++	.get_subflow	= mptcp_sched_redundant_get_subflow,
++	.name		= "redundant",
++	.owner		= THIS_MODULE,
++};
++
++bool mptcp_sched_is_redundant(const struct mptcp_sock *msk)
++{
++	return msk->sched == &mptcp_sched_redundant;
++}
++
+ /* Must be called with rcu read lock held */
+ struct mptcp_sched_ops *mptcp_sched_find(const char *name)
+ {
+@@ -103,6 +166,7 @@ void mptcp_unregister_scheduler(struct mptcp_sched_ops *sched)
+ void mptcp_sched_init(void)
+ {
+ 	mptcp_register_scheduler(&mptcp_sched_default);
++	mptcp_register_scheduler(&mptcp_sched_redundant);
+ }
+ 
+ int mptcp_init_sched(struct mptcp_sock *msk,

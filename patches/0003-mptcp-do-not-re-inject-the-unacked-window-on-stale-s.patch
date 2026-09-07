@@ -1,0 +1,49 @@
+From c3c41336ce509312a7c30db33abff9e4cbac524c Mon Sep 17 00:00:00 2001
+From: Stefan Heimersheim <stefan.heimersheim@gmail.com>
+Date: Sat, 5 Sep 2026 23:16:18 +0100
+Subject: [PATCH 3/4] mptcp: do not re-inject the unacked window on stale
+ subflows with the redundant scheduler
+
+When the path manager marks a subflow stale (no progress for
+stale_loss_cnt retransmit timeouts while another subflow is healthy),
+mptcp_pm_nl_subflow_chk_stale() re-injects the whole unacked window via
+__mptcp_retransmit_pending_data(), because with a single-subflow-per-round
+scheduler the data queued on the stale subflow exists nowhere else.
+
+With the redundant scheduler every other active subflow has already been
+handed that data, or catches up on it the next time it can send (see
+__subflow_push_redundant()). Re-injecting it again makes the healthy links
+carry the unacked window a third time. In the netns test (20 ms RTT,
+100 Mbit paths, 30 % loss on one path) this showed up as the healthy path
+transmitting 149 % of the payload instead of ~107 %.
+
+Skip the re-injection for redundant connections; the stale marking itself
+and the MPTCP_MIB_SUBFLOWSTALE accounting are unchanged, and the
+msk-level retransmit timer still covers the case where no subflow carried
+a range.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ net/mptcp/pm_netlink.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/net/mptcp/pm_netlink.c b/net/mptcp/pm_netlink.c
+index 7ea8ccd16..b5dcd3d69 100644
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -1355,7 +1355,14 @@ void mptcp_pm_nl_subflow_chk_stale(const struct mptcp_sock *msk, struct sock *ss
+ 			slow = lock_sock_fast(ssk);
+ 			if (!tcp_rtx_and_write_queues_empty(ssk)) {
+ 				subflow->stale = 1;
+-				__mptcp_retransmit_pending_data(sk);
++				/* With the redundant scheduler the other subflows
++				 * already carry (or catch up on) everything this
++				 * one has queued; re-injecting the whole unacked
++				 * window would only duplicate it once more on the
++				 * healthy links.
++				 */
++				if (!mptcp_sched_is_redundant(msk))
++					__mptcp_retransmit_pending_data(sk);
+ 				MPTCP_INC_STATS(net, MPTCP_MIB_SUBFLOWSTALE);
+ 			}
+ 			unlock_sock_fast(ssk, slow);
