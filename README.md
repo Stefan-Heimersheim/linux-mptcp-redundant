@@ -88,8 +88,6 @@ syncookie/checksum groups pass too, and only the link-failure group's
 per-link-usage and stale-count expectations differ (it assumes a backup
 link carries nothing; the redundant scheduler uses it by design).
 
-**Not yet verified:** real links (VPS over the Internet, Pi with LTE modems).
-
 ## Build
 
 A plain `./build-kernel.sh` is the whole release build: it builds both
