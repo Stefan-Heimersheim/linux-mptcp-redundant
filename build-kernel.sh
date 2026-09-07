@@ -208,8 +208,9 @@ config_arm64(){
 
 config_x86_64(){
     local b="$1"
-    # base: the VPS's Debian cloud kernel config; DRM must stay off (the rpi
-    # tree does not link it without CONFIG_OF); no debug info (-dbg not shipped)
+    # base: the VPS's Debian cloud kernel config. DRM off: the rpi source tree
+    # fails to link it on x86_64 (a downstream backlight patch assumes CONFIG_OF).
+    # No debug info: the -dbg package is not shipped.
     cp "$ROOT/$VPS_BASE_CONFIG" "$b/.config"
     "$b/scripts/config" --file "$b/.config" --disable DRM \
         --disable DEBUG_INFO_BTF --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
