@@ -36,6 +36,7 @@ RELEASE_REPO="${RELEASE_REPO:-${GH_REPO:-https://github.com/Stefan-Heimersheim/l
 CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 JOBS="${JOBS:-$(nproc)}"
 LOCALVERSION="-mptcp-redundant"
+VPS_BASE_CONFIG="config-6.12.100+deb13-cloud-amd64"   # /boot/config-* of the VPS's Debian kernel
 PKG_REVISION="${PKG_REVISION:-1}"
 
 # Identity embedded in the artifacts instead of the build machine's user@host:
@@ -207,15 +208,17 @@ config_arm64(){
 
 config_x86_64(){
     local b="$1"
-    make -C "$b" ARCH=x86_64 x86_64_defconfig
-    "$b/scripts/kconfig/merge_config.sh" -m -O "$b" "$b/.config" "$ROOT/build-x86_64.config" >/dev/null
-    # The rpi tree does not link DRM without CONFIG_OF (a downstream backlight
-    # patch declares backlight_set_display_name() unconditionally but defines
-    # it under CONFIG_OF); a VPS has no GPU and keeps the VGA text console.
-    "$b/scripts/config" --file "$b/.config" --disable DRM
+    # base: the VPS's Debian cloud kernel config. DRM off: the rpi source tree
+    # fails to link it on x86_64 (a downstream backlight patch assumes CONFIG_OF).
+    # No debug info: the -dbg package is not shipped.
+    cp "$ROOT/$VPS_BASE_CONFIG" "$b/.config"
+    "$b/scripts/config" --file "$b/.config" --disable DRM \
+        --disable DEBUG_INFO_BTF --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
+        --disable DEBUG_INFO_DWARF4 --disable DEBUG_INFO_DWARF5 --enable DEBUG_INFO_NONE
     config_common "$b"
     make -C "$b" ARCH=x86_64 olddefconfig
-    for opt in MPTCP MPTCP_IPV6 VIRTIO_NET VIRTIO_BLK EXT4_FS NF_NAT IP_NF_IPTABLES NFT_COMPAT; do
+    for opt in MPTCP MPTCP_IPV6 VIRTIO_PCI VIRTIO_NET VIRTIO_BLK SCSI_VIRTIO EXT4_FS \
+               NF_NAT IP_NF_IPTABLES NFT_COMPAT KVM_GUEST; do
         grep -q "^CONFIG_$opt=[ym]" "$b/.config" || die "x86_64 config: CONFIG_$opt not set"
     done
 }
@@ -235,8 +238,11 @@ build_target(){ # arch
         arm64) margs=(ARCH=arm64 CROSS_COMPILE="$CROSS") ;;
         x86_64) margs=(ARCH=x86_64) ;;
     esac
-    info "Building $arch kernel in worktree $b"
-    ensure_worktree "$b"
+    # Pi: the raspberrypi tree. VPS: upstream stable, so it carries no Pi-only
+    # core changes (mm, cgroup); the two only differ outside net/mptcp.
+    local base; base="$([ "$arch" = arm64 ] && echo "$RPI_REV" || echo "$STABLE_REV")"
+    info "Building $arch kernel in worktree $b from $base + patches"
+    patched_worktree "$b" "$base"
     mkdir -p "$OUT"
     make -s -C "$b" mrproper
     "config_$arch" "$b"
@@ -296,10 +302,11 @@ release_notes(){
     cat <<EOT
 MPTCP redundant-scheduler kernel packages for the Raspberry Pi (arm64, \`bcm2711_defconfig\`, \`kernel8.img\`) and the VPS (amd64).
 
-- Source: $RPI_REPO branch \`$RPI_BRANCH\` at \`$RPI_REV\` (Linux $kver)
+- arm64 source: $RPI_REPO branch \`$RPI_BRANCH\` at \`$RPI_REV\` (Linux $kver)
+- amd64 source: upstream stable \`$STABLE_TAG\` (\`$STABLE_REV\`)
 - Patch series: $(find "$PATCHES" -name '*.patch' | wc -l) patches in \`patches/\`, sha256 of the concatenated series: \`$series\`
 - \`sysctl -w net.mptcp.scheduler=redundant\` makes the sender transmit every byte on every subflow; both ends need this kernel for both directions. See README.md for what was verified (netns tests incl. negative control, KASAN/lockdep, upstream mptcp selftests) and what was not (real links).
-- The amd64 kernel is built from \`x86_64_defconfig\` + \`build-x86_64.config\` (generic KVM/Xen/Hyper-V guest, storage and netfilter drivers built in).
+- The amd64 kernel is built from the Debian 13 cloud kernel config (\`$VPS_BASE_CONFIG\`) run through \`olddefconfig\` on the 6.12.107 tree, without debug info.
 
 Asset names carry the Debian architecture (\`_arm64.deb\` / \`_amd64.deb\`) so both coexist in one release.
 
@@ -374,7 +381,7 @@ if $SOURCE_ONLY; then
     exit 0
 fi
 deps
-source_tree_from_patches
+fetch_source
 for t in $TARGETS; do
     build_target "$t"
 done

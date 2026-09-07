@@ -3,12 +3,18 @@
 # pinned source revision, patch application, post-build assertions.
 # Sourced, not executed. Expects ROOT and SRC to be set by the caller.
 
-# Pinned upstream state: raspberrypi/linux branch rpi-6.12.y as of 2026-08-28
-# ("serial: sc16is7xx: Don't spin if no data received"), kernel 6.12.107.
-# Never build from a moving branch; bump this deliberately.
+# Pinned sources, both Linux 6.12.107. Never build from a moving branch; bump
+# these deliberately and together.
+# Pi (arm64): raspberrypi/linux branch rpi-6.12.y as of 2026-08-28
+# ("serial: sc16is7xx: Don't spin if no data received").
 RPI_REV="${RPI_REV:-1138716fb8a796625e519982e53a7b3c89e76ca4}"
 RPI_REPO="${RPI_REPO:-https://github.com/raspberrypi/linux}"
 RPI_BRANCH="${RPI_BRANCH:-rpi-6.12.y}"
+# VPS (x86_64): upstream stable tag v6.12.107 (the rpi tree is this plus the
+# Pi downstream patches; net/mptcp is identical in both). Fetched into $SRC too.
+STABLE_REV="${STABLE_REV:-f717995cb7dcd8998ab15516b8006aea09cfde0d}"
+STABLE_REPO="${STABLE_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
+STABLE_TAG="${STABLE_TAG:-v6.12.107}"
 WORK_BRANCH="mptcp-redundant"
 PATCHES="$ROOT/patches"
 
@@ -17,17 +23,24 @@ ok(){ printf '\033[1;32mOK %s\033[0m\n' "$*"; }
 warn(){ printf '\033[1;33mWARNING: %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Make sure $SRC contains RPI_REV (clone or fetch as needed).
+# Make sure $SRC contains RPI_REV and STABLE_REV (clone or fetch as needed).
 fetch_source(){
 	if [ ! -d "$SRC/.git" ]; then
 		info "cloning $RPI_REPO ($RPI_BRANCH) into $SRC"
 		git clone --depth=1 --branch "$RPI_BRANCH" "$RPI_REPO" "$SRC"
 	fi
-	if ! git -C "$SRC" cat-file -e "$RPI_REV^{commit}" 2>/dev/null; then
-		info "fetching pinned revision $RPI_REV"
-		git -C "$SRC" fetch --depth=1 origin "$RPI_REV" ||
-			die "cannot fetch $RPI_REV from $RPI_REPO; is RPI_REV correct?"
-	fi
+	fetch_rev "$RPI_REPO" "$RPI_REV"
+	fetch_rev "$STABLE_REPO" "$STABLE_REV" "$STABLE_TAG"
+}
+
+fetch_rev(){ # repo rev [ref]
+	local repo="$1" rev="$2" ref="${3:-$2}"
+	git -C "$SRC" cat-file -e "$rev^{commit}" 2>/dev/null && return 0
+	info "fetching pinned revision $rev ($ref) from $repo"
+	git -C "$SRC" fetch --depth=1 "$repo" "$ref" ||
+		die "cannot fetch $ref from $repo"
+	git -C "$SRC" cat-file -e "$rev^{commit}" 2>/dev/null ||
+		die "$ref from $repo is not $rev; is the pin correct?"
 }
 
 # Reset branch $WORK_BRANCH to RPI_REV and apply patches/*.patch with git am.
@@ -68,6 +81,26 @@ ensure_worktree(){ # dir
 		warn "$SRC has uncommitted changes; they are NOT part of the worktree $dir"
 	fi
 	ok "worktree $dir at $(git -C "$dir" log --oneline -1)"
+}
+
+# Detached worktree at $2 with patches/*.patch applied on top (for the
+# package builds, which start from different base revisions per target).
+patched_worktree(){ # dir base_rev
+	local dir="$1" base="$2"
+	fetch_source
+	if [ -e "$dir/.git" ]; then
+		git -C "$dir" am --abort 2>/dev/null || true
+		git -C "$dir" checkout -q --detach "$base" || die "cannot update worktree $dir"
+	else
+		mkdir -p "$(dirname "$dir")"
+		git -C "$SRC" worktree prune
+		git -C "$SRC" worktree add -q --detach "$dir" "$base" || die "cannot create worktree $dir"
+	fi
+	git -C "$dir" am --3way "$PATCHES"/*.patch >/dev/null || {
+		git -C "$dir" am --abort || true
+		die "patches from $PATCHES do not apply on $base"
+	}
+	ok "worktree $dir at $(git -C "$dir" rev-parse --short HEAD) = $(git -C "$dir" log --oneline -1 "$base") + patches"
 }
 
 # Export the commits on $WORK_BRANCH above RPI_REV into patches/.
