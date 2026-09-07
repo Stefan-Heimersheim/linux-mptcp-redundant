@@ -104,7 +104,11 @@ step that needs `GH_TOKEN`.
 GH_TOKEN=... ./build-kernel.sh --release-only                       # upload the staged set to the GitHub release
 ```
 
-The release is named after the kernel version (`v6.12.107`); the notes state
+The release is named after the full Debian package version (`v6.12.107-1`).
+For a rebuild on the same kernel base (config or patch change) bump the
+revision with `PKG_REVISION=2 ./build-kernel.sh`: packages become
+`…_6.12.107-2_*.deb` and the release `v6.12.107-2`, so a release name is never
+reused and the installers see a new package version. The notes state
 the pinned source revision and the sha256 of the patch series, and the
 uploaded set is the two `linux-image-*` and two `linux-headers-*` packages
 (the arm64 `-dbg` package and `linux-libc-dev` are not uploaded).
