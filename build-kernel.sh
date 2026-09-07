@@ -15,7 +15,11 @@
 # mptcp-redundant. A patch that does not apply aborts the build.
 #
 # Optional env:
-#   KDEB_PKGVERSION=6.12.107-1    Debian package version (default: kernelversion-1)
+#   PKG_REVISION=2                Debian package revision (default 1). Bump it for every
+#                                 rebuild on the same kernel base (config or patch change):
+#                                 packages become <kernelversion>-<revision> and the release
+#                                 is named v<kernelversion>-<revision>, so no name is reused.
+#   KDEB_PKGVERSION=6.12.107-2    full Debian package version (overrides PKG_REVISION)
 #   RELEASE_REPO=https://github.com/Stefan-Heimersheim/linux-mptcp-redundant
 #   GH_TOKEN=...                  for --release
 #   JOBS=N                        make -j (default nproc)
@@ -32,6 +36,7 @@ RELEASE_REPO="${RELEASE_REPO:-${GH_REPO:-https://github.com/Stefan-Heimersheim/l
 CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 JOBS="${JOBS:-$(nproc)}"
 LOCALVERSION="-mptcp-redundant"
+PKG_REVISION="${PKG_REVISION:-1}"
 
 # Identity embedded in the artifacts instead of the build machine's user@host:
 # the .deb Maintainer field (mkdebian reads DEBFULLNAME/DEBEMAIL) and the
@@ -220,7 +225,7 @@ config_x86_64(){
 pkgversion(){ # builddir make-args...
     local b="$1"; shift
     if [ -n "${KDEB_PKGVERSION:-}" ]; then printf '%s\n' "$KDEB_PKGVERSION"
-    else printf '%s-1\n' "$(make -s -C "$b" "$@" kernelversion)"; fi
+    else printf '%s-%s\n' "$(make -s -C "$b" "$@" kernelversion)" "$PKG_REVISION"; fi
 }
 
 build_target(){ # arch
@@ -261,11 +266,13 @@ infer_release_name(){
     local file base version
     file="$(find "$OUT" -type f -name 'linux-image-*.deb' ! -name '*-dbg_*' | sort | head -n1)"
     [ -n "$file" ] || die "No linux-image .deb found in $OUT"
+    # release name = v<full Debian package version> (v6.12.107-1), so a rebuild on
+    # the same kernel base with PKG_REVISION=2 never reuses a release name
     base="$(basename "$file")"
-    version="${base#linux-image-}"
+    version="${base#*_}"
     version="${version%%_*}"
-    if [[ "$version" =~ ^([0-9]+[.][0-9]+[.][0-9]+) ]]; then
-        printf 'v%s\n' "${BASH_REMATCH[1]}"
+    if [[ "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+-[0-9A-Za-z.~+]+$ ]]; then
+        printf 'v%s\n' "$version"
     else
         die "Could not infer release name from $base"
     fi
