@@ -238,8 +238,11 @@ build_target(){ # arch
         arm64) margs=(ARCH=arm64 CROSS_COMPILE="$CROSS") ;;
         x86_64) margs=(ARCH=x86_64) ;;
     esac
-    info "Building $arch kernel in worktree $b"
-    ensure_worktree "$b"
+    # Pi: the raspberrypi tree. VPS: upstream stable, so it carries no Pi-only
+    # core changes (mm, cgroup); the two only differ outside net/mptcp.
+    local base; base="$([ "$arch" = arm64 ] && echo "$RPI_REV" || echo "$STABLE_REV")"
+    info "Building $arch kernel in worktree $b from $base + patches"
+    patched_worktree "$b" "$base"
     mkdir -p "$OUT"
     make -s -C "$b" mrproper
     "config_$arch" "$b"
@@ -299,7 +302,8 @@ release_notes(){
     cat <<EOT
 MPTCP redundant-scheduler kernel packages for the Raspberry Pi (arm64, \`bcm2711_defconfig\`, \`kernel8.img\`) and the VPS (amd64).
 
-- Source: $RPI_REPO branch \`$RPI_BRANCH\` at \`$RPI_REV\` (Linux $kver)
+- arm64 source: $RPI_REPO branch \`$RPI_BRANCH\` at \`$RPI_REV\` (Linux $kver)
+- amd64 source: upstream stable \`$STABLE_TAG\` (\`$STABLE_REV\`)
 - Patch series: $(find "$PATCHES" -name '*.patch' | wc -l) patches in \`patches/\`, sha256 of the concatenated series: \`$series\`
 - \`sysctl -w net.mptcp.scheduler=redundant\` makes the sender transmit every byte on every subflow; both ends need this kernel for both directions. See README.md for what was verified (netns tests incl. negative control, KASAN/lockdep, upstream mptcp selftests) and what was not (real links).
 - The amd64 kernel is built from the Debian 13 cloud kernel config (\`$VPS_BASE_CONFIG\`) run through \`olddefconfig\` on the 6.12.107 tree, without debug info.
@@ -377,7 +381,7 @@ if $SOURCE_ONLY; then
     exit 0
 fi
 deps
-source_tree_from_patches
+fetch_source
 for t in $TARGETS; do
     build_target "$t"
 done

@@ -13,8 +13,8 @@ downloads).
 
 | path | purpose |
 |---|---|
-| `patches/000[1-4]-*.patch` | the kernel change, a 4-patch series on top of `raspberrypi/linux` `rpi-6.12.y` at the pinned revision in `build-lib.sh` (`RPI_REV`, Linux 6.12.107) |
-| `build-kernel.sh` | checks out `RPI_REV`, applies `patches/` with `git am`, builds arm64 (Pi, `bcm2711_defconfig`) and x86_64 (VPS) `.deb` packages, optionally uploads a GitHub release |
+| `patches/000[1-4]-*.patch` | the kernel change, a 4-patch series that applies to both pinned sources in `build-lib.sh`: `raspberrypi/linux` `rpi-6.12.y` at `RPI_REV` (Pi) and upstream stable `v6.12.107` at `STABLE_REV` (VPS); `net/mptcp` is identical in the two |
+| `build-kernel.sh` | applies `patches/` with `git am` on the pinned base of each target, builds arm64 (Pi, `bcm2711_defconfig`, rpi tree) and x86_64 (VPS, upstream stable) `.deb` packages, optionally uploads a GitHub release |
 | `build-lib.sh` | shared helpers: pinned revision, patch application, post-build assertion that the redundant scheduler is really in the object code |
 | `config-6.12.100+deb13-cloud-amd64` | `/boot/config-*` of the VPS's Debian cloud kernel, the base for the x86_64 build (`olddefconfig` on top) |
 | `test/check.sh` | build the x86_64 test kernel, boot it with virtme-ng, run the netns test and the upstream selftests; exit 0 iff all pass |

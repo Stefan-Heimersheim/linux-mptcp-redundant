@@ -18,6 +18,8 @@
 #   --no-build         skip the kernel build (reuse the existing image)
 #   --debug            build in build-x86-debug/ with DEBUG_LIST, PROVE_LOCKING,
 #                      KASAN (slow)
+#   --stable           build in build-x86-stable/ from upstream stable STABLE_REV
+#                      + patches/ (the VPS base) instead of the linux-rpi tree
 #   --reconfig         regenerate .config from defconfig + test/x86-test.config
 #                      (done automatically when .config is missing)
 #   SKIP_SELFTESTS=1   only run test/mptcp-redundant.sh
@@ -34,14 +36,15 @@ OUT="$ROOT/out"
 # shellcheck source=../build-lib.sh
 . "$ROOT/build-lib.sh"
 
-BUILD=1 DEBUG=0 RECONFIG=0 FROM_PATCHES=0
+BUILD=1 DEBUG=0 RECONFIG=0 FROM_PATCHES=0 STABLE=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--no-build) BUILD=0 ;;
 	--debug) DEBUG=1 ;;
+	--stable) STABLE=1 ;;
 	--reconfig) RECONFIG=1 ;;
 	--from-patches) FROM_PATCHES=1 ;;
-	-h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+	-h|--help) sed -n '2,30p' "$0"; exit 0 ;;
 	*) die "unknown argument: $1" ;;
 	esac
 	shift
@@ -76,7 +79,11 @@ fi
 # ---------------------------------------------------------------- build
 # The normal test kernel is built in tree (vng finds arch/x86/boot/bzImage).
 # The debug variant lives in its own worktree so the two configs never fight.
-if [ "$DEBUG" = 1 ]; then
+if [ "$STABLE" = 1 ]; then
+	[ "$DEBUG" = 0 ] || die "--stable and --debug cannot be combined"
+	O="$ROOT/build-x86-stable/linux"
+	patched_worktree "$O" "$STABLE_REV"
+elif [ "$DEBUG" = 1 ]; then
 	O="$ROOT/build-x86-debug/linux"
 	ensure_worktree "$O"
 else
